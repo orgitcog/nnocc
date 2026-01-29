@@ -51,6 +51,9 @@ OPTION(BUILD_ATEN "Build ATen tensor library" ON)
 OPTION(BUILD_ATENSPACE "Build ATenSpace (AtomSpace + Tensor embeddings)" ON)
 OPTION(BUILD_TENSOR_LOGIC "Build Tensor Logic integration layer" ON)
 
+# Neural Network Framework
+OPTION(BUILD_NN "Build nn (Lua/Torch neural network library)" ON)
+
 # External integration packages
 OPTION(BUILD_GNUCASH "Build Gnucash cognitive accounting integration" OFF)
 OPTION(BUILD_KOBOLDCPP "Build KoboldCpp story/world modeling integration" OFF)
@@ -213,6 +216,14 @@ ENDIF()
 IF(BUILD_COGSELF AND BUILD_COGGML)
     MESSAGE(STATUS "Building CogSelf AGI Cognitive Synergy Framework...")
     add_subdirectory(cogself)
+ENDIF()
+
+# Neural Network Framework - Lua/Torch nn library
+IF(BUILD_NN)
+    MESSAGE(STATUS "Building nn (Lua/Torch neural network framework)...")
+    MESSAGE(STATUS "  Location: nn/")
+    MESSAGE(STATUS "  Note: Lua library - no CMake build needed")
+    MESSAGE(STATUS "  See nn/README.md for usage")
 ENDIF()
 
 # External integration packages
