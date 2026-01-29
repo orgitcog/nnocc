@@ -1,0 +1,312 @@
+name: Build Electron Desktop App
+
+# Builds the OpenCog Inferno AGI Desktop Application
+# Depends on successful Windows builds to provide native libraries
+# Creates installers for Windows, Linux, and macOS
+
+on:
+  workflow_run:
+    workflows: ["OCC Windows Build"]
+    types:
+      - completed
+    branches:
+      - main
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      skip_native:
+        description: 'Skip native addon build (for UI-only changes)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  NODE_VERSION: '20'
+  ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
+  ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/electron-builder
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    name: Build Windows Desktop App
+    if: |
+      github.event.workflow_run.conclusion == 'success' ||
+      github.event_name == 'release' ||
+      github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: electron-app/package-lock.json
+    
+    - name: Setup MSVC
+      uses: microsoft/setup-msbuild@v2
+    
+    - name: Download OpenCog Build Artifacts
+      if: github.event.inputs.skip_native != 'true'
+      uses: actions/download-artifact@v4
+      with:
+        path: opencog-artifacts
+      continue-on-error: true
+    
+    - name: Prepare OpenCog Libraries
+      if: github.event.inputs.skip_native != 'true'
+      shell: pwsh
+      run: |
+        Write-Host "=== Preparing OpenCog Libraries ===" -ForegroundColor Cyan
+        
+        # Create install directory structure
+        New-Item -ItemType Directory -Force -Path "install/lib" | Out-Null
+        New-Item -ItemType Directory -Force -Path "install/include" | Out-Null
+        New-Item -ItemType Directory -Force -Path "install/bin" | Out-Null
+        
+        # Copy artifacts if available
+        if (Test-Path "opencog-artifacts") {
+          Write-Host "Copying OpenCog artifacts..." -ForegroundColor Yellow
+          
+          # Copy all .lib files
+          Get-ChildItem -Path "opencog-artifacts" -Recurse -Filter "*.lib" | ForEach-Object {
+            Copy-Item -Path $_.FullName -Destination "install/lib/" -Force
+            Write-Host "  Copied: $($_.Name)" -ForegroundColor Green
+          }
+          
+          # Copy all .dll files
+          Get-ChildItem -Path "opencog-artifacts" -Recurse -Filter "*.dll" | ForEach-Object {
+            Copy-Item -Path $_.FullName -Destination "install/bin/" -Force
+            Write-Host "  Copied: $($_.Name)" -ForegroundColor Green
+          }
+          
+          # Copy header files
+          Get-ChildItem -Path "opencog-artifacts" -Recurse -Filter "*.h" | ForEach-Object {
+            $relativePath = $_.FullName.Replace((Get-Location).Path, "").TrimStart("\")
+            $destPath = Join-Path "install/include" $_.Name
+            Copy-Item -Path $_.FullName -Destination $destPath -Force
+          }
+          
+          Write-Host "✓ OpenCog libraries prepared" -ForegroundColor Green
+        } else {
+          Write-Host "⚠ No OpenCog artifacts found - native addon will use mock mode" -ForegroundColor Yellow
+        }
+    
+    - name: Update Native Addon Library Paths
+      if: github.event.inputs.skip_native != 'true'
+      shell: pwsh
+      run: |
+        Write-Host "=== Updating Native Addon Configuration ===" -ForegroundColor Cyan
+        
+        $bindingGyp = "electron-app/native/binding.gyp"
+        $content = Get-Content $bindingGyp -Raw
+        
+        # Update Windows library paths to point to install directory
+        $content = $content -replace '\.\./\.\./build/Release/', '../../../install/lib/'
+        
+        Set-Content -Path $bindingGyp -Value $content
+        Write-Host "✓ Library paths updated" -ForegroundColor Green
+    
+    - name: Install Electron App Dependencies
+      shell: pwsh
+      run: |
+        Write-Host "=== Installing Electron App Dependencies ===" -ForegroundColor Cyan
+        Set-Location electron-app
+        npm ci
+        Write-Host "✓ Dependencies installed" -ForegroundColor Green
+    
+    - name: Build Native Addon
+      if: github.event.inputs.skip_native != 'true'
+      shell: pwsh
+      run: |
+        Write-Host "=== Building Native Cognitive Addon ===" -ForegroundColor Cyan
+        Set-Location electron-app
+        
+        # Set environment variables for native build
+        $env:CMAKE_PREFIX_PATH = "$env:GITHUB_WORKSPACE/install"
+        
+        # Rebuild native addon
+        npm run rebuild
+        
+        if (Test-Path "native/build/Release/cognitive-addon.node") {
+          Write-Host "✓ Native addon built successfully" -ForegroundColor Green
+        } else {
+          Write-Host "⚠ Native addon build failed - app will run in mock mode" -ForegroundColor Yellow
+        }
+      continue-on-error: true
+    
+    - name: Build Electron Application
+      shell: pwsh
+      run: |
+        Write-Host "=== Building Electron Application ===" -ForegroundColor Cyan
+        Set-Location electron-app
+        npm run build:win
+        Write-Host "✓ Electron app built" -ForegroundColor Green
+    
+    - name: List Build Outputs
+      shell: pwsh
+      run: |
+        Write-Host "=== Build Outputs ===" -ForegroundColor Cyan
+        if (Test-Path "electron-app/dist") {
+          Get-ChildItem -Path "electron-app/dist" -Recurse -File | ForEach-Object {
+            $size = [math]::Round($_.Length / 1MB, 2)
+            Write-Host "  $($_.Name) - ${size}MB" -ForegroundColor Green
+          }
+        }
+    
+    - name: Upload Windows Installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: electron-app-windows
+        path: |
+          electron-app/dist/*.exe
+          electron-app/dist/*.msi
+        retention-days: 30
+    
+    - name: Upload to Release
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          electron-app/dist/*.exe
+          electron-app/dist/*.msi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-linux:
+    runs-on: ubuntu-latest
+    name: Build Linux Desktop App
+    if: |
+      github.event.workflow_run.conclusion == 'success' ||
+      github.event_name == 'release' ||
+      github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        submodules: recursive
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: electron-app/package-lock.json
+    
+    - name: Install System Dependencies
+      run: |
+        echo "=== Installing System Dependencies ==="
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          libboost-all-dev \
+          libgsl-dev \
+          guile-3.0-dev \
+          libpq-dev \
+          libssl-dev \
+          uuid-dev
+        echo "✓ Dependencies installed"
+    
+    - name: Build OpenCog Components
+      run: |
+        echo "=== Building OpenCog Components for Linux ==="
+        
+        # Build CogUtil
+        mkdir -p cogutil/build
+        cd cogutil/build
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/install
+        make -j$(nproc)
+        make install
+        cd ../..
+        
+        # Build AtomSpace
+        mkdir -p atomspace/build
+        cd atomspace/build
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/install -DCMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/install
+        make -j$(nproc)
+        make install
+        cd ../..
+        
+        # Build Attention
+        if [ -d "attention" ]; then
+          mkdir -p attention/build
+          cd attention/build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/install -DCMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/install
+          make -j$(nproc)
+          make install
+          cd ../..
+        fi
+        
+        echo "✓ OpenCog components built"
+    
+    - name: Install Electron App Dependencies
+      run: |
+        echo "=== Installing Electron App Dependencies ==="
+        cd electron-app
+        npm ci
+        echo "✓ Dependencies installed"
+    
+    - name: Build Native Addon
+      run: |
+        echo "=== Building Native Cognitive Addon ==="
+        cd electron-app
+        export CMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/install
+        npm run rebuild
+        echo "✓ Native addon built"
+      continue-on-error: true
+    
+    - name: Build Electron Application
+      run: |
+        echo "=== Building Electron Application ==="
+        cd electron-app
+        npm run build:linux
+        echo "✓ Electron app built"
+    
+    - name: Upload Linux Packages
+      uses: actions/upload-artifact@v4
+      with:
+        name: electron-app-linux
+        path: |
+          electron-app/dist/*.AppImage
+          electron-app/dist/*.deb
+        retention-days: 30
+    
+    - name: Upload to Release
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          electron-app/dist/*.AppImage
+          electron-app/dist/*.deb
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-summary:
+    runs-on: ubuntu-latest
+    name: Build Summary
+    needs: [build-windows, build-linux]
+    if: always()
+    
+    steps:
+    - name: Generate Summary
+      run: |
+        echo "# Electron Desktop App Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Build Status" >> $GITHUB_STEP_SUMMARY
+        echo "- Windows: ${{ needs.build-windows.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Linux: ${{ needs.build-linux.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ needs.build-windows.result }}" = "success" ] && [ "${{ needs.build-linux.result }}" = "success" ]; then
+          echo "✅ All builds completed successfully!" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️ Some builds failed. Check logs for details." >> $GITHUB_STEP_SUMMARY
+        fi
